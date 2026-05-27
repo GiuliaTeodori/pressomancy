@@ -6,3 +6,6 @@ technical_description.txt
 .coverage
 doc/sphinx/build
 AGENT.md
+UPLOAD_VIEW/**/*.txt
+UPLOAD_VIEW/**/*.png
+UPLOAD_VIEW/**/*.h5
