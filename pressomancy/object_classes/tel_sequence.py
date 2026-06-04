@@ -2,7 +2,7 @@ import espressomd
 import numpy as np
 import random
 from pressomancy.object_classes.quadriplex_class import *
-from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
+from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams 
 from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec, get_perpendicular, align_vectors
 import logging
 import warnings
@@ -95,7 +95,7 @@ class TelSeq(metaclass=Simulation_Object):
     '''
     Class that contains TelSeq relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a TelSeq. Therefore many relevant parameters are class specific, not instance specific.
     '''
-    required_features=['MORSE',]
+    required_features=['MORSE']	
     numInstances = 0
     simulation_type=SinglePairDict('tel_seq', 37)
     part_types = PartDictSafe({'real': 1, 'virt': 2,'to_be_magnetized':3})
@@ -124,7 +124,7 @@ class TelSeq(metaclass=Simulation_Object):
             self.params['associated_objects']= [Quadriplex(config=elem) for elem in quadriplex_config_list]
         self.associated_objects=self.params['associated_objects']
 
-        self.build_function=RoutineWithArgs(func=make_centered_rand_orient_point_array,num_monomers=self.params['n_parts'],spacing=config['spacing'])
+        self.build_function=RoutineWithArgs(func=make_centered_rand_orient_point_array,num_monomers=self.params['n_parts'],spacing=config['spacing'])  
         self.who_am_i = TelSeq.numInstances
         TelSeq.numInstances += 1
         self.orientor = np.empty(shape=3, dtype=float)
@@ -134,9 +134,9 @@ class TelSeq(metaclass=Simulation_Object):
         chain_dir = np.asarray(chain_dir, dtype=float)
         chain_dir /= np.linalg.norm(chain_dir)
 
+        z_axis = np.array([0.0, 0.0, 1.0])
         x_axis = np.array([1.0, 0.0, 0.0])
         y_axis = np.array([0.0, 1.0, 0.0])
-        z_axis = np.array([0.0, 0.0, 1.0])
 
         best_phi = 0.0
         best_score = -np.inf
@@ -147,7 +147,7 @@ class TelSeq(metaclass=Simulation_Object):
             x_world = rotation_matrix @ x_axis
             y_world = rotation_matrix @ y_axis
             score = max(np.abs(np.dot(x_world, chain_dir)), np.abs(np.dot(y_world, chain_dir)))
-            if score > best_score + 1e-08:
+            if score > best_score + 1e-12:
                 best_score = score
                 best_phi = phi
         return best_phi
@@ -184,6 +184,20 @@ class TelSeq(metaclass=Simulation_Object):
         '''
         for iid in range(len(self.associated_objects)):
             monomer = self.associated_objects[iid]
+            ########################
+            #METTIAMO LE ESCLUSIONI
+            circ_parts = []
+            for q in monomer.associated_objects:  # tutti i quartet del monomero
+                for p in q.unperturbed_particles:  # tutti i particles, non solo corner
+                    if p.type == q.part_types['circ']:
+                        circ_parts.append(p)
+            # applica exclusion tra tutte le circ del monomero
+            for i, p1 in enumerate(circ_parts):
+                for p2 in circ_parts[i+1:]:
+                    print(f"Applying exclusion between circ particles {p1.id} and {p2.id} in monomer {monomer.who_am_i}")
+                    p1.add_exclusion(p2)
+
+            #########################
             candidates1 = []
             candidates1.extend(monomer.associated_objects[1].corner_particles)
             candidates1.extend(monomer.associated_objects[2].corner_particles)
@@ -247,3 +261,40 @@ class TelSeq(metaclass=Simulation_Object):
             except IndexError:
                 logging.info('end of chain reached')
                 continue
+    def get_full_chain(self):
+        """
+        Ricostruisce la catena completa del filamento usando tutti i bond
+        tra tutte le corner particles di tutti i Quadriplex.
+        """
+        all_corners = []
+        for quad in self.associated_objects:
+            for quartet in quad.associated_objects:
+                all_corners += quartet.corner_particles
+
+        corner_ids = set(c.id for c in all_corners)
+        corner_map = {c.id: c for c in all_corners}
+
+        adjacency = {c.id: set() for c in all_corners}
+        for corner in all_corners:
+            for bond in corner.bonds:
+                for partner_id in bond[1:]:
+                    if partner_id in corner_ids:
+                        adjacency[corner.id].add(partner_id)
+                        adjacency[partner_id].add(corner.id)
+
+        endpoints = [cid for cid, neighbors in adjacency.items() if len(neighbors) == 1]
+        print(f"Capi del filamento: {endpoints} ({len(endpoints)} capi)")
+        assert len(endpoints) == 2, f"Attesi 2 capi, trovati {len(endpoints)}"
+
+        chain = []
+        current = endpoints[0]
+        visited = set()
+        while current is not None:
+            chain.append(corner_map[current])
+            visited.add(current)
+            next_candidates = adjacency[current] - visited
+            current = next_candidates.pop() if next_candidates else None
+
+        assert len(chain) == len(all_corners), f"Catena incompleta: {len(chain)}/{len(all_corners)}"
+        print(f"Catena completa ({len(chain)} punti): {[c.id for c in chain]}")
+        return chain
