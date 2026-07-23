@@ -86,7 +86,7 @@ class Quartet(GenericRigidObj):
         if self.params['type'] in ['brokenA', 'brokenB']:
             assert self.params['bond_handle'] != None, 'broken quartets require a bond to be set!!!'
             Quartet.part_types.update({'circ': 28, 
-                  'squareA': 24, 'squareB': 25, 'cation': 27,'deactivatedcation':200,'deactivatecharged':400,'charged':26,'patch':100,'patchA':101,'patchB':102})
+                  'squareA': 24, 'squareB': 25, 'cation': 27,'deactivatedcation':200,'deactivatecharged':400,'charged':26,'patch':100,'patchA':101,'patchB':102,'lateral':103,'propeller':104,'diagonal':105,'loop':106})
         self.who_am_i = Quartet.numInstances
         Quartet.numInstances += 1
         self.orientor = np.empty(shape=3, dtype=float)
@@ -560,21 +560,67 @@ class Quadriplex(metaclass=Simulation_Object):
             else:
                 dst_patches[dst_key].add_bond((dihedral_handle, dst_corner, src_corner, src_patches[src_key]))
         
-    def add_dihedrals(self):
-        assert len(
-            self.associated_objects) == 3, "a quadriplex can only be created from 3 quartets!!! "
+    def add_dihedrals(self, dihedral_potential_handle=None):
+            assert len(
+                self.associated_objects) == 3, "a quadriplex can only be created from 3 quartets!!! "
+            
+            if dihedral_potential_handle is None:
+                # Di default crea quello standard
+                dihedral_potential_handle = espressomd.interactions.Dihedral(bend=2000, mult=1, phase=np.pi/2.)
+                self.sys.bonded_inter.add(dihedral_potential_handle)
+            
+            center_quartet = self.associated_objects[0]
+            top_quartet = self.associated_objects[1]
+            bottom_quartet = self.associated_objects[2]
+
+            self._add_dihedrals_between(top_quartet, center_quartet, dihedral_potential_handle, target_phase=np.pi/2.)
+            self._add_dihedrals_between(center_quartet, bottom_quartet, dihedral_potential_handle, target_phase=np.pi/2.)    
+    def add_extra_bendings(self, bending_potential_handle=None):
+        if bending_potential_handle is None:
+            # Se non viene fornito, crea quello di default
+            bending_potential_handle = espressomd.interactions.AngleHarmonic(bend=2000.0, phi0=np.pi/2.)
+            self.sys.bonded_inter.add(bending_potential_handle)
         center_quartet = self.associated_objects[0]
         top_quartet = self.associated_objects[1]
         bottom_quartet = self.associated_objects[2]
 
-        dihedral = espressomd.interactions.Dihedral(bend=2000, mult=1, phase=np.pi/2.)
-        self.sys.bonded_inter.add(dihedral)
-        self._add_dihedrals_between(top_quartet, center_quartet, dihedral, target_phase=np.pi/2.)
-        self._add_dihedrals_between(center_quartet, bottom_quartet, dihedral, target_phase=np.pi/2.)
+        top_patch_map = self._build_corner_patch_map(top_quartet)
+        center_patch_map = self._build_corner_patch_map(center_quartet)
+        bottom_patch_map = self._build_corner_patch_map(bottom_quartet)
 
-    def add_extra_bendings(self):
-        angle_another = espressomd.interactions.AngleHarmonic(bend=2000.0, phi0=np.pi/2.)
-        self.sys.bonded_inter.add(angle_another)
+        # 1. Quartica TOP -> orientata verso la quartica CENTER
+        for ref_corner in top_quartet.corner_particles:
+            closest_corner = self._nearest_corner(ref_corner, center_quartet.corner_particles)
+            ref_patches = top_patch_map[ref_corner.id]
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner))
+
+        # 2. Quartica CENTER -> orientata sia verso BOTTOM che verso TOP (Modificato)
+        for ref_corner in center_quartet.corner_particles:
+            ref_patches = center_patch_map[ref_corner.id]
+            
+            # Angoli verso BOTTOM (già esistenti)
+            closest_corner_bottom = self._nearest_corner(ref_corner, bottom_quartet.corner_particles)
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner_bottom))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner_bottom))
+            
+            # Angoli verso TOP (AGGIUNTI ORA)
+            closest_corner_top = self._nearest_corner(ref_corner, top_quartet.corner_particles)
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner_top))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner_top))
+
+        # 3. Quartica BOTTOM -> orientata verso la quartica CENTER
+        for ref_corner in bottom_quartet.corner_particles:
+            closest_corner = self._nearest_corner(ref_corner, center_quartet.corner_particles)
+            ref_patches = bottom_patch_map[ref_corner.id]
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner))
+    '''
+    def add_extra_bendings(self,bending_potential_handle=None):
+        if bending_potential_handle is None:
+            # Se non viene fornito, crea quello di default
+            bending_potential_handle = espressomd.interactions.AngleHarmonic(bend=2000.0, phi0=np.pi/2.)
+            self.sys.bonded_inter.add(bending_potential_handle)
         center_quartet = self.associated_objects[0]
         top_quartet = self.associated_objects[1]
         bottom_quartet = self.associated_objects[2]
@@ -586,21 +632,21 @@ class Quadriplex(metaclass=Simulation_Object):
         for ref_corner in top_quartet.corner_particles:
             closest_corner = self._nearest_corner(ref_corner, center_quartet.corner_particles)
             ref_patches = top_patch_map[ref_corner.id]
-            ref_corner.add_bond((angle_another, ref_patches['squareB'], closest_corner))
-            ref_corner.add_bond((angle_another, ref_patches['squareA'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner))
 
         for ref_corner in center_quartet.corner_particles:
             closest_corner = self._nearest_corner(ref_corner, bottom_quartet.corner_particles)
             ref_patches = center_patch_map[ref_corner.id]
-            ref_corner.add_bond((angle_another, ref_patches['squareB'], closest_corner))
-            ref_corner.add_bond((angle_another, ref_patches['squareA'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner))
 
         for ref_corner in bottom_quartet.corner_particles:
             closest_corner = self._nearest_corner(ref_corner, center_quartet.corner_particles)
             ref_patches = bottom_patch_map[ref_corner.id]
-            ref_corner.add_bond((angle_another, ref_patches['squareB'], closest_corner))
-            ref_corner.add_bond((angle_another, ref_patches['squareA'], closest_corner))
-
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareB'], closest_corner))
+            ref_corner.add_bond((bending_potential_handle, ref_patches['squareA'], closest_corner))
+    '''
 
     def get_corner_chain(self):
         all_corners = []
