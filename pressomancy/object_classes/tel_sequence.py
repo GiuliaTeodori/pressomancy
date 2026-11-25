@@ -6,6 +6,8 @@ from pressomancy.object_classes.object_class import Simulation_Object, ObjectCon
 from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec, get_perpendicular, align_vectors
 import logging
 import warnings
+import json
+import os
 
 TELSEQ_RULES = {
     'quartet': {
@@ -394,6 +396,65 @@ class TelSeq(metaclass=Simulation_Object):
                 c = cand[int(np.argmin([np.linalg.norm(x.pos - pos_exit) for x in cand]))]
                 self.bond_owned_part_pair(c, self.sys.part.by_id(exit_id))
                 entry = c.id
+
+    # particle types left out of real_to_virtual in filaments_connection.json: squareA (24), squareB (25),
+    # cation (27), patch (100). Same set used by the production scripts before 25-11-2026.
+    TOPOLOGY_EXCLUDED_TYPES = (24, 25, 27, 100)
+
+    def topology_dict(self, excluded_types=TOPOLOGY_EXCLUDED_TYPES):
+        '''
+        Topology record of this TelSeq, as written in filaments_connection.json:
+          - 'topology': self.params['type'] (a string, or a list of fold types 5'->3' for per-domain chains);
+          - 'ordered_reals': ids of the real particles along the chain, 5'->3' (= get_full_chain);
+          - 'real_to_virtual': {real id: [ids of its virtual sites]}, skipping excluded_types
+            (on the virtual and on its real). Keys are ints here, strings after json.dump.
+        Read-only: it does not change particle types (unlike the old in-script loop, which also retyped the
+        central circ to 400; that is now Quadriplex.deactivate_center_pi_stacking).
+        '''
+        excluded = set(int(t) for t in excluded_types)
+        flat_map = {}
+        for quad in self.associated_objects:
+            for quartet in quad.associated_objects:
+                for part_type, plist in quartet.type_part_dict.items():
+                    for p in plist:
+                        if int(p.type) in excluded:
+                            continue
+                        rel = getattr(p, 'vs_relative', None)
+                        if rel is None or rel[0] == -1:
+                            continue
+                        real_id = int(rel[0])
+                        if int(self.sys.part.by_id(real_id).type) in excluded:
+                            continue
+                        flat_map.setdefault(real_id, []).append(int(p.id))
+        return {
+            'topology': self.params['type'],
+            'ordered_reals': [int(c.id) for c in self.get_full_chain()],
+            'real_to_virtual': flat_map,
+        }
+
+    @staticmethod
+    def write_topology_json(telseqs, out_dir, overwrite=False):
+        '''
+        Write corner_order.json and filaments_connection.json for a list of TelSeq (index in the list = chain id),
+        in the format used by all the G4 analysis scripts:
+          corner_order.json          {chain id: ordered_reals}
+          filaments_connection.json  {chain id: {'topology', 'ordered_reals', 'real_to_virtual'}}
+        Call it after wrap_into_Tel (and add_h_bond_patches), on a fresh start only.
+        With overwrite=False an existing file is left untouched (as in the production scripts, safe on restarts).
+        :return: (corner_order, filaments_connection) dicts
+        '''
+        filaments = {fil_id: fil.topology_dict() for fil_id, fil in enumerate(telseqs)}
+        corner_order = {fil_id: rec['ordered_reals'] for fil_id, rec in filaments.items()}
+        os.makedirs(out_dir, exist_ok=True)
+        for name, data in (('corner_order.json', corner_order), ('filaments_connection.json', filaments)):
+            path = os.path.join(out_dir, name)
+            if overwrite or not os.path.exists(path):
+                with open(path, 'w') as f:
+                    json.dump(data, f, indent=2)
+                logging.info('written %s', path)
+            else:
+                logging.info('%s exists, not overwritten', path)
+        return corner_order, filaments
 
     def get_full_chain(self):
         # Definiamo i tipi di particella che compongono la catena portante (corner e loop)

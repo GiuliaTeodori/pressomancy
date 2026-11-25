@@ -560,14 +560,63 @@ class Quadriplex(metaclass=Simulation_Object):
             else:
                 dst_patches[dst_key].add_bond((dihedral_handle, dst_corner, src_corner, src_patches[src_key]))
         
+    # Default stiffness of the patch-G-G angles and of the patch-G-G-patch dihedrals (G4 CG model, eps_patch 3.75).
+    # Before 25-11-2026 the defaults were bend=2000 and every call created a new potential;
+    # production scripts always passed bend=250 explicitly, so passing a handle still works as before.
+    DEFAULT_ANGLE_BEND = 250.0
+    DEFAULT_DIHEDRAL_BEND = 250.0
+    _default_handles = {}
+
+    def _default_bonded_handle(self, kind):
+        '''
+        Return the default angle ('angle') or dihedral ('dihedral') potential, creating it and adding it to
+        self.sys.bonded_inter only the first time for this espresso system (one shared bonded type, not one per G4).
+        '''
+        key = (kind, id(self.sys))
+        if key not in Quadriplex._default_handles:
+            if kind == 'angle':
+                handle = espressomd.interactions.AngleHarmonic(bend=Quadriplex.DEFAULT_ANGLE_BEND, phi0=np.pi/2.)
+            elif kind == 'dihedral':
+                handle = espressomd.interactions.Dihedral(bend=Quadriplex.DEFAULT_DIHEDRAL_BEND, mult=1, phase=np.pi/2.)
+            else:
+                raise ValueError(f'unknown default bonded kind: {kind}')
+            self.sys.bonded_inter.add(handle)
+            Quadriplex._default_handles[key] = handle
+        return Quadriplex._default_handles[key]
+
+    def deactivate_center_pi_stacking(self):
+        '''
+        Switch off pi-stacking for the central tetrad: its 4 circ particles (type 28) become type 400.
+
+        Only the circ particles of the outer tetrads (top = quartet 1, bottom = quartet 2) keep type 28, so the
+        28-28 LJ (eps_pi) acts only between the outer planes of different G4s (circ particles of the same G4 are
+        excluded from each other in TelSeq.wrap_into_Tel). Type 400 has no non-bonded interaction set (no LJ, no WCA);
+        the central circ sits inside the G4, so it is shielded anyway.
+        400 is the value already registered in Quartet.part_types as 'deactivatecharged' (PartDictSafe forbids a
+        second name for it) and it is the value used in all production data so far.
+
+        Call it AFTER TelSeq.wrap_into_Tel (the circ exclusions there are found by type 28).
+        Idempotent. Not needed after a restart from checkpoint: particle types are stored in the checkpoint.
+        Before 25-11-2026 this was done inside the json-writing loop of the production scripts.
+        :return: list of the retyped particle handles
+        '''
+        center_quartet = self.associated_objects[0]
+        circ_type = center_quartet.part_types['circ']
+        off_type = center_quartet.part_types['deactivatecharged']
+        changed = []
+        for part in center_quartet.unperturbed_particles:
+            if part.type == circ_type:
+                part.type = off_type
+                changed.append(part)
+        return changed
+
     def add_dihedrals(self, dihedral_potential_handle=None):
             assert len(
                 self.associated_objects) == 3, "a quadriplex can only be created from 3 quartets!!! "
             
             if dihedral_potential_handle is None:
-                # Di default crea quello standard
-                dihedral_potential_handle = espressomd.interactions.Dihedral(bend=2000, mult=1, phase=np.pi/2.)
-                self.sys.bonded_inter.add(dihedral_potential_handle)
+                # default: Dihedral(bend=DEFAULT_DIHEDRAL_BEND=250, mult=1, phase=pi/2), shared by all quadriplexes
+                dihedral_potential_handle = self._default_bonded_handle('dihedral')
             
             center_quartet = self.associated_objects[0]
             top_quartet = self.associated_objects[1]
@@ -577,9 +626,8 @@ class Quadriplex(metaclass=Simulation_Object):
             self._add_dihedrals_between(center_quartet, bottom_quartet, dihedral_potential_handle, target_phase=np.pi/2.)    
     def add_extra_bendings(self, bending_potential_handle=None):
         if bending_potential_handle is None:
-            # Se non viene fornito, crea quello di default
-            bending_potential_handle = espressomd.interactions.AngleHarmonic(bend=2000.0, phi0=np.pi/2.)
-            self.sys.bonded_inter.add(bending_potential_handle)
+            # default: AngleHarmonic(bend=DEFAULT_ANGLE_BEND=250, phi0=pi/2), shared by all quadriplexes
+            bending_potential_handle = self._default_bonded_handle('angle')
         center_quartet = self.associated_objects[0]
         top_quartet = self.associated_objects[1]
         bottom_quartet = self.associated_objects[2]
