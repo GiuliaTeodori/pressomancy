@@ -128,7 +128,19 @@ class TelSeq(metaclass=Simulation_Object):
         Initialisation of a TelSeq object requires the specification of particle size, number of parts and a handle to the espresso system
         '''
         self.sys=config['espresso_handle']
-        assert config['type'] in ['parallel', 'antiparallel', 'hybrid', 'hybrid1', 'hybrid2'], 'type must be either parallel, antiparallel, hybrid, hybrid1 or hybrid2!!!'
+        if isinstance(config['type'], (list, tuple)):
+            # Per-domain topology (added 25-11-2026, branch topologia_per_dominio).
+            # 'type' may be a list with one fold type per G4 domain, listed 5'->3' along the chain,
+            # e.g. ['hybrid1', 'hybrid2'] = H1-H2, ['hybrid2', 'hybrid1', 'hybrid2'] = H2-H1-H2.
+            # Only hybrid1/hybrid2 are supported. Read from the 5' plane: hybrid1 = P-L-L, hybrid2 = L-L-P.
+            # A box can mix different sequences (e.g. 510 H1-H2 + 510 H2-H1) by giving each TelSeq its own list,
+            # as long as all chains have the same n_parts.
+            # A plain string keeps the original behaviour (same fold for all domains, wrap_into_Tel unchanged).
+            assert len(config['type']) == config['n_parts'], 'a list type needs one fold type per domain (len == n_parts)!!!'
+            assert all(t in ['hybrid1', 'hybrid2'] for t in config['type']), 'a list type can contain only hybrid1 or hybrid2!!!'
+            config['type'] = list(config['type'])
+        else:
+            assert config['type'] in ['parallel', 'antiparallel', 'hybrid', 'hybrid1', 'hybrid2'], 'type must be either parallel, antiparallel, hybrid, hybrid1 or hybrid2!!!'
         self.params=config
         if self.params['associated_objects']==None:
             warnings.warn('no associated_objects have been passed explicity. Creating objects required to initialise object implicitly!')
@@ -198,6 +210,9 @@ class TelSeq(metaclass=Simulation_Object):
         :return: None
 
         '''
+        # list type (one fold per domain, 5'->3'): dedicated builder, see _wrap_per_domain
+        if isinstance(self.params['type'], list):
+            return self._wrap_per_domain()
         pos_first = self.associated_objects[0].associated_objects[0].unperturbed_particles[0].pos
         pos_last = self.associated_objects[-1].associated_objects[0].unperturbed_particles[0].pos
         v_chain = pos_last - pos_first
@@ -297,6 +312,89 @@ class TelSeq(metaclass=Simulation_Object):
             except IndexError:
                 logging.info('end of chain reached')
                 continue
+    @staticmethod
+    def _exclude_circ(monomer):
+        '''Exclusions among the circ particles of one monomer (same as done inside wrap_into_Tel).'''
+        circ_parts = [p for q in monomer.associated_objects for p in q.unperturbed_particles if p.type == q.part_types['circ']]
+        for i, p1 in enumerate(circ_parts):
+            for p2 in circ_parts[i+1:]:
+                p1.add_exclusion(p2)
+
+    def domain_types(self):
+        '''Fold type of each domain, ordered 5'->3'. For a string type, the same type repeated n_parts times.'''
+        if isinstance(self.params['type'], list):
+            return list(self.params['type'])
+        return [self.params['type']] * len(self.associated_objects)
+
+    def _wrap_per_domain(self):
+        '''
+        Build a TelSeq with one fold type per domain (self.params['type'] is a list, 5'->3', only hybrid1/hybrid2).
+
+        Convention (the same used by get_full_chain and in filaments_connection.json):
+          - the whole chain has a single 5'->3' direction, the one of hybrid1 in wrap_into_Tel;
+          - every domain is entered at a top corner (quartet 1 = the 5' plane of that domain)
+            and left at a bottom corner (quartet 2 = its 3' plane);
+          - read from the 5' plane: hybrid1 = P-L-L, hybrid2 = L-L-P.
+
+        Per domain:
+          - hybrid1: rule_maker('hybrid1', entry) gives diag/across bonds and the exit corner (free_end);
+          - hybrid2: rule_maker('hybrid2', b) builds hybrid2 starting from a bottom corner b. We walk it backwards:
+                     we look for the unique bottom corner b whose free_end is our top entry corner, and b
+                     becomes the exit. Same bonds as the original hybrid2, just traversed 5'->3'.
+          - linker: a bond_handle bond from the exit corner to the closest top corner of the next domain,
+                    which is the entry of the next domain.
+
+        Side effects (used by get_full_chain and by the analysis):
+          - self.domain_order: indices of associated_objects in 5'->3' order;
+          - self.start_part_id: the 5' corner of the chain (entry of the first domain).
+
+        Note: with a string type the original wrap_into_Tel is used, so pure hybrid2 chains are still built
+        as before (traversed from the other end, linker bottom->top); with a list type all linkers go top->bottom.
+        Validated on 25-11-2026 (dimers/trimers, all H1/H2 combinations, 2040 G4 boxes with restart from checkpoint).
+        '''
+        types_53 = self.params['type']
+        n = len(self.associated_objects)
+        p0 = self.associated_objects[0].associated_objects[0].unperturbed_particles[0].pos
+        p1 = self.associated_objects[-1].associated_objects[0].unperturbed_particles[0].pos
+        order = list(range(n))
+        if np.dot(p1 - p0, self.orientor) > 0:   # same domain order as hybrid1 in wrap_into_Tel
+            order = order[::-1]
+        self.domain_order = order                # indices of associated_objects in 5'->3' order
+        entry = None
+        for k, iid in enumerate(order):
+            monomer = self.associated_objects[iid]
+            self._exclude_circ(monomer)
+            alias = monomer.associated_objects[0].params['alias']
+            rules = TELSEQ_RULES[alias]
+            offset = monomer.who_am_i * rules['block_size']
+            if entry is None:
+                # 5' end of the chain: a random top corner of the first domain
+                entry = random.choice(monomer.associated_objects[1].corner_particles).id
+                self.start_part_id = entry
+            fold = types_53[k]
+            if fold == 'hybrid1':
+                diag_pairs, across_pairs, exit_id = rule_maker('hybrid1', entry, offset)
+            else:
+                sol = []
+                for b in rules['bottom']:
+                    d_, a_, fe = rule_maker('hybrid2', b + offset, offset)
+                    if fe == entry:
+                        sol.append((d_, a_, b + offset))
+                assert len(sol) == 1, f'hybrid2: {len(sol)} solutions for entry corner {entry}'
+                diag_pairs, across_pairs, exit_id = sol[0]
+            logging.debug("wrap_per_domain k=%s monomer_id=%s fold=%s entry=%s exit=%s", k, monomer.who_am_i, fold, entry, exit_id)
+            for id1, id2 in diag_pairs:
+                self.bond_owned_part_pair(self.sys.part.by_id(id1), self.sys.part.by_id(id2), bond_handle=self.params['diag_bond_handle'])
+            for id1, id2 in across_pairs:
+                self.bond_owned_part_pair(self.sys.part.by_id(id1), self.sys.part.by_id(id2), bond_handle=self.params['across_bond_handle'])
+            if k + 1 < n:
+                nxt = self.associated_objects[order[k + 1]]
+                cand = nxt.associated_objects[1].corner_particles   # top corners of the next domain
+                pos_exit = self.sys.part.by_id(exit_id).pos
+                c = cand[int(np.argmin([np.linalg.norm(x.pos - pos_exit) for x in cand]))]
+                self.bond_owned_part_pair(c, self.sys.part.by_id(exit_id))
+                entry = c.id
+
     def get_full_chain(self):
         # Definiamo i tipi di particella che compongono la catena portante (corner e loop)
         # Tipo 1: corner reali del G-quadruplex
