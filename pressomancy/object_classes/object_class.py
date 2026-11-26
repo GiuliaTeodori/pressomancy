@@ -2,6 +2,7 @@ from pressomancy.helper_functions import RoutineWithArgs, PartDictSafe, SinglePa
 import types
 from functools import partial
 import logging
+import sys
 import espressomd
 import itertools
 
@@ -233,7 +234,14 @@ class Simulation_Object(type):
         The simulation lifecycle explicitly releases stored objects. When Python
         destroys the object, delete owned particles and decrement the counters
         that were incremented along its class hierarchy.
+
+        Particles are NOT removed while the interpreter is shutting down: at exit Python destroys every object,
+        and removing particles from an ESPResSo 4.2 system that is itself being torn down segfaults
+        (the run dies before the final checkpoint is written and the HDF5 file is left unreadable).
+        At exit the particles disappear with the process anyway.
         """
+        if sys.is_finalizing():
+            return
         self.delete_owned_parts()
         for cls in self.__class__.mro():
             if hasattr(cls, "numInstances") and cls.numInstances > 0:
